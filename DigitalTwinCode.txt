@@ -1,0 +1,709 @@
+#Required packages are imported
+from dash import Dash, html, dcc, Output, Input, State
+import pandas as pd
+import plotly.graph_objects as go
+import base64
+import openpyxl
+import utm
+import io
+import numpy as np
+from scipy.interpolate import griddata
+
+import folium
+from folium.plugins import HeatMap
+from folium.plugins import HeatMapWithTime, MarkerCluster
+import collections
+try
+    from collections import OrderedDict
+except ImportError
+    OrderedDict = dict
+from collections import defaultdict
+from IPython.display import IFrame
+from IPython.core.display import HTML
+
+from pyproj import Transformer
+epsg_36201 = EPSG32601
+epsg_4326 = EPSG4326
+transformer = Transformer.from_crs(epsg_36201, epsg_4326)
+
+import plotly.express as px
+import threading
+import time
+
+import subprocess
+df_lock = threading.Lock()
+
+#Dash app is set up
+app = Dash(__name__)
+
+#Variable df is set to the dataframe created in 'DataframeText.py'
+#df = pd.read_csv('CUsersyangh149DesktopResearchAramcoDigital TwinNewData2.csv')
+
+csv_path = 'CUsersyangh149DesktopResearchAramcoDigital Twindataframe.csv'
+df = pd.read_csv(csv_path)
+
+#Middle coordinates of map are stored for later use
+lat = df['X Coordinate'].mean()
+lon = df['Y Coordinate'].mean()
+
+#Function to create a dataframe from the user-uploaded files
+def create_dataframe(xlsx, txts, names)
+    x, y, number, minutes = [], [], [], []
+    table = openpyxl.load_workbook(io.BytesIO(xlsx))
+    sheet = table.active
+    file = txts[0].decode('utf-8').splitlines()
+
+    for min in range(len(file))
+        for row in range(1, sheet.max_row + 1)
+            num_points = sheet.cell(row=row, column=5).value
+            col = 6
+            for j in range(num_points)
+                xval = sheet.cell(row=row, column=col).value
+                col += 1
+                yval = sheet.cell(row=row, column=col).value
+                col += 1
+                xval, yval = utm.to_latlon(xval, yval, 18, 'N')
+                x.append(xval)
+                y.append(yval)
+                number.append(sheet.cell(row=row, column=1).value)
+                minutes.append(min)
+
+    data = pd.DataFrame({'X Coordinate' x, 'Y Coordinate' y, 'Link Number' number, 'Minute' minutes})
+
+    for txt, name in zip(txts, names)
+        file = txt.decode('utf-8').splitlines()
+        file_arr = []
+        for sec in range(len(file))
+            for row in range(1, sheet.max_row + 1)
+                num_points = sheet.cell(row=row, column=5).value
+                for j in range(num_points)
+                    file_arr.append(float(file[sec].split()[row - 1]))
+        data[name] = file_arr
+
+    return data
+
+#Function which names the colorbar 'Seconds' if the selected powertrain option is 'Time' and names it 'Gallons' otherwise
+def titler(powertrain)
+    if powertrain == 'Time'
+        return 'Seconds'
+    return 'Gallons'
+
+def update_powertrain_options()
+    global map
+    columns = df.columns
+    map = {col col for col in columns if col not in ['X Coordinate', 'Y Coordinate', 'Minute', 'Link Number']}
+    return [{'label' key, 'value' key} for key in map.keys()]
+
+#Sets up the visual layout of the GUI
+app.layout = html.Div([
+    #Gives the title 'Power Map' to the GUI
+    html.H4('Power Map'),
+
+    #Displays text which says 'Powertrain Type'
+    html.P('Powertrain Type'),
+    #Puts buttons on the GUI which allow user to switch between plots of different powertrains
+    dcc.RadioItems(
+        options=update_powertrain_options(),
+        value='Electric',
+        inline=True,
+        id='buttons'
+    ),
+
+    #Enables the dropdown menu which allows user to switch among 2D, 2D Heatmap, and 3D mode
+    dcc.Dropdown(['2D Mode', '2D Heatmap', '3D Mode'], '2D Mode', id='mode_switch'),
+    dcc.Store(id='stored_mode', data='2D Mode'),
+
+    #Displays two plots side by side
+    html.Div([
+        dcc.Loading(dcc.Graph(id='graph', style={'width' '85vh', 'height' '80vh'}), type='circle'),
+        dcc.Loading(dcc.Graph(id='graph2', style={'width' '85vh', 'height' '80vh'}), type='circle'),
+        dcc.Interval(id='interval-component', interval=301000, n_intervals=0)
+    ], style={'display' 'flex', 'flex-direction' 'row'}),
+
+    #Enables button which allows users to upload their own files
+    dcc.Loading(
+        id=loading-upload,
+        children=[
+            dcc.Upload(
+                id='upload_data',
+                children=html.Button('Select Files', className='btn btn-primary'),
+                multiple=True
+            )
+        ],
+        type='circle'
+    )
+])
+
+#Takes input from 'Select Files' button and changes the GUI accordingly
+@app.callback(
+    [Output('buttons', 'options'),
+     Output('buttons', 'value')],
+    [Input('upload_data', 'contents')],
+    [State('upload_data', 'filename')]
+)
+def update_files(list_of_contents, list_of_names)
+    global df
+    if list_of_contents is not None and len(list_of_contents)  0
+        txt_files, txt_names = [], []
+        excel = None
+        for content, name in zip(list_of_contents, list_of_names)
+            content_type, content_string = content.split(',')
+            decoded = base64.b64decode(content_string)
+            if name.endswith('.xlsx')
+                excel = decoded
+            elif name.endswith('.txt')
+                txt_files.append(decoded)
+                txt_names.append(name)
+        if excel is not None
+            df = create_dataframe(excel, txt_files, txt_names)
+        return update_powertrain_options(), 'Electric'
+    return update_powertrain_options(), 'Electric'
+
+#Keeps track of selected mode whenever the mode is switched from 2D to 3D or vice versa
+@app.callback(
+    Output('stored_mode', 'data'),
+    Input('mode_switch', 'value')
+)
+def update_mode(selected_mode)
+    return selected_mode
+
+#Taking selected powertrain and mode as inputs, outputs the plots
+@app.callback(
+    Output('graph', 'figure'),
+    Output('graph2', 'figure'),
+    Input('buttons', 'value'),
+    Input('stored_mode', 'data'),
+    Input('interval-component', 'n_intervals')
+)
+
+def update_graph(powertrain, mode, n_intervals)
+    global_min = df[powertrain].min()
+    global_max = df[powertrain].max()
+
+    with df_lock
+        current_df = df.copy()
+
+    line_color = 'lightblue' if powertrain in ['Electric', 'PHEV'] else 'blue'
+
+    #Plots the 2D line graphs
+    if mode == '2D Mode'
+        frames = []
+        #Builds and stores the plot of every 15 minutes of the data in the frames array
+        for minute in df['Minute'].unique()
+            filtered_df = df[df['Minute'] == minute]
+            frame = go.Frame(
+                data=[go.Scattermapbox(
+                    lat=filtered_df['X Coordinate'],
+                    lon=filtered_df['Y Coordinate'],
+                    mode='lines+markers',
+                    marker=go.scattermapbox.Marker(
+                        size=4,
+                        color=filtered_df[powertrain],
+                        colorscale='Jet',
+                        cmin=global_min,
+                        cmax=global_max,
+                        colorbar=dict(title=titler(powertrain))
+                    ),
+                    line=dict(color=line_color),
+                    text=filtered_df[powertrain],
+                    hoverinfo='text'
+                )],
+                name=str(minute)
+            )
+            frames.append(frame)
+
+        #Sets up the intitial frame which will appear when GUI is loaded
+        initial_df = df[df['Minute'] == 15]
+        fig = go.Figure(
+            data=[go.Scattermapbox(
+                lat=initial_df['X Coordinate'],
+                lon=initial_df['Y Coordinate'],
+                mode='lines+markers',
+                marker=go.scattermapbox.Marker(
+                    size=4,
+                    color=initial_df[powertrain],
+                    colorscale='Jet',
+                    cmin=global_min,
+                    cmax=global_max,
+                    colorbar=dict(title=titler(powertrain))
+                ),
+                line=dict(color=line_color),
+                text=initial_df[powertrain],
+                hoverinfo='text'
+            )],
+            frames=frames
+        )
+
+        #Sets up the layout of the plots, including map styling, setting titles, building the timeline, etc.
+        fig.update_layout(
+            mapbox_style='carto-positron',
+            mapbox_zoom=11,
+            mapbox_center={'lat' lat, 'lon' lon},
+            transition={'duration' 1000},
+            mapbox=dict(
+                bounds={west min(df['Y Coordinate']) - 0.1, east max(df['Y Coordinate']) + 0.1, south min(df['X Coordinate']) - 0.1, north max(df['X Coordinate']) + 0.1}
+            ),
+            title='Actual Power Consumption',
+            sliders=[{
+                steps [{
+                    args [
+                        [frame.name],
+                        {frame {duration 1000, redraw True},
+                         mode immediate,
+                         transition {duration 1000}}
+                    ],
+                    label frame.name,
+                    method animate
+                } for frame in frames],
+                transition {duration 1000},
+                x 0,
+                y 0,
+                currentvalue {font {size 20}, prefix Minute, visible True, xanchor center},
+                len 1.0
+            }],
+            updatemenus=[{
+                buttons [
+                    {
+                        args [None, {frame {duration 1250, redraw True},
+                                        fromcurrent True, transition {duration 1000}}],
+                        label Play,
+                        method animate
+                    },
+                    {
+                        args [[None], {frame {duration 0, redraw True},
+                                          mode immediate, transition {duration 0}}],
+                        label Pause,
+                        method animate
+                    }
+                ],
+                direction left,
+                pad {r 10, t 50},
+                showactive False,
+                type buttons,
+                x 0.1,
+                xanchor right,
+                y -0.15,
+                yanchor top
+            }]
+        )
+
+        #Does the same thing as above just for predicted power consumption (Predicted power consumption data not implemented yet)
+        fig2 = go.Figure(
+            data=[go.Scattermapbox(
+                lat=initial_df['X Coordinate'],
+                lon=initial_df['Y Coordinate'],
+                mode='lines+markers',
+                marker=go.scattermapbox.Marker(
+                    size=4,
+                    color=initial_df[powertrain],
+                    colorscale='Jet',
+                    cmin=global_min,
+                    cmax=global_max,
+                    colorbar=dict(title=titler(powertrain))
+                ),
+                line=dict(color=line_color),
+                text=initial_df[powertrain],
+                hoverinfo='text'
+            )],
+            frames=frames
+        )
+
+        fig2.update_layout(
+            mapbox_style='carto-positron',
+            mapbox_zoom=11,
+            mapbox_center={'lat' lat, 'lon' lon},
+            transition={'duration' 1000},
+            mapbox=dict(
+                bounds={west min(df['Y Coordinate']) - 0.1, east max(df['Y Coordinate']) + 0.1, south min(df['X Coordinate']) - 0.1, north max(df['X Coordinate']) + 0.1}
+            ),
+            title='Predicted Power Consumption',
+            sliders=[{
+                steps [{
+                    args [
+                        [frame.name],
+                        {frame {duration 1500, redraw True},
+                         mode immediate,
+                         transition {duration 1000}}
+                    ],
+                    label frame.name,
+                    method animate
+                } for frame in frames],
+                transition {duration 1000},
+                x 0,
+                y 0,
+                currentvalue {font {size 20}, prefix Minute, visible True, xanchor center},
+                len 1.0
+            }],
+            updatemenus=[{
+                buttons [
+                    {
+                        args [None, {frame {duration 1250, redraw True},
+                                        fromcurrent True, transition {duration 1000}}],
+                        label Play,
+                        method animate
+                    },
+                    {
+                        args [[None], {frame {duration 0, redraw True},
+                                          mode immediate, transition {duration 0}}],
+                        label Pause,
+                        method animate
+                    }
+                ],
+                direction left,
+                pad {r 10, t 50},
+                showactive False,
+                type buttons,
+                x 0.1,
+                xanchor right,
+                y -0.15,
+                yanchor top
+            }]
+        )
+
+        return fig, fig2
+
+    elif mode == '2D Heatmap0'
+        heatmap_frames = []
+        minutes = sorted(df['Minute'].unique())
+    
+        # Create heatmap data per minute
+        for minute in minutes
+            minute_df = df[df['Minute'] == minute].dropna(subset=['X Coordinate', 'Y Coordinate', powertrain])
+            if minute_df.empty
+                continue
+
+            # Grid coordinates
+            xi = np.linspace(minute_df['X Coordinate'].min(), minute_df['X Coordinate'].max(), 100)
+            yi = np.linspace(minute_df['Y Coordinate'].min(), minute_df['Y Coordinate'].max(), 100)
+            xi, yi = np.meshgrid(xi, yi)
+            zi = griddata(
+                (minute_df['X Coordinate'], minute_df['Y Coordinate']),
+                minute_df[powertrain],
+                (xi, yi),
+                method='linear',
+                fill_value=0
+            )
+
+            heatmap = go.Heatmap(
+                x=xi[0],
+                y=yi[, 0],
+                z=zi,
+                colorscale='Jet',
+                zmin=df[powertrain].min(),
+                zmax=df[powertrain].max(),
+                colorbar=dict(title=titler(powertrain))
+            )
+
+            heatmap_frames.append(go.Frame(data=[heatmap], name=str(minute)))
+
+        # Initial frame
+        initial_df = df[df['Minute'] == 15].dropna(subset=['X Coordinate', 'Y Coordinate', powertrain])
+        xi = np.linspace(initial_df['X Coordinate'].min(), initial_df['X Coordinate'].max(), 100)
+        yi = np.linspace(initial_df['Y Coordinate'].min(), initial_df['Y Coordinate'].max(), 100)
+        xi, yi = np.meshgrid(xi, yi)
+        zi = griddata(
+            (initial_df['X Coordinate'], initial_df['Y Coordinate']),
+            initial_df[powertrain],
+            (xi, yi),
+            method='linear',
+            fill_value=0
+        )
+
+        fig1 = go.Figure(
+            data=[go.Heatmap(
+                x=xi[0],
+                y=yi[, 0],
+                z=zi,
+                colorscale='Jet',
+                zmin=df[powertrain].min(),
+                zmax=df[powertrain].max(),
+                colorbar=dict(title=titler(powertrain))
+            )],
+            frames=heatmap_frames
+        )
+
+        fig1.update_layout(
+            title='2D Heatmap - Actual',
+            xaxis_title='Longitude',
+            yaxis_title='Latitude',
+            sliders=[{
+                steps [{
+                    args [[frame.name],
+                             {frame {duration 1000, redraw True},
+                              mode immediate,
+                              transition {duration 1000}}],
+                    label frame.name,
+                    method animate
+                } for frame in heatmap_frames],
+                transition {duration 1000},
+                x 0,
+                y 0,
+                currentvalue {font {size 20}, prefix Minute, visible True, xanchor center},
+                len 1.0
+            }],
+            updatemenus=[{
+                buttons [
+                    {args [None, {frame {duration 1000, redraw True},
+                                    fromcurrent True, transition {duration 1000}}],
+                     label Play,
+                     method animate},
+                    {args [[None], {frame {duration 0, redraw True},
+                                       mode immediate, transition {duration 0}}],
+                     label Pause,
+                     method animate}
+                ],
+                direction left,
+                pad {r 10, t 50},
+                showactive False,
+                type buttons,
+                x 0.1,
+                xanchor right,
+                y -0.15,
+                yanchor top
+            }]
+        )
+
+        # You can duplicate the above to make fig2 (Predicted), or just return fig1 twice for now
+        return fig1, fig1
+    
+    elif mode == '2D Heatmap'
+        actual_df = df.copy()
+
+        lat_center = actual_df[X Coordinate].mean()
+        lon_center = actual_df[Y Coordinate].mean()
+        zmin = actual_df[powertrain].min()
+        zmax = actual_df[powertrain].max()
+
+        fig = px.density_mapbox(
+            actual_df,
+            lat=X Coordinate,
+            lon=Y Coordinate,
+            z=powertrain,
+            radius=10,
+            center={lat lat_center, lon lon_center},
+            zoom=11,
+            mapbox_style=carto-positron,
+            animation_frame=Minute,
+            color_continuous_scale=Jet,
+            range_color=[zmin, 5zmax]
+        )
+        fig.update_layout(title='Actual Power Consumption')
+
+        # You can reuse the same data for predicted until prediction data is added
+        predict_df=df.copy()
+        fig2 = px.density_mapbox(
+            predict_df,
+            lat=X Coordinate,
+            lon=Y Coordinate,
+            z=powertrain,
+            radius=10,
+            center={lat lat_center, lon lon_center},
+            zoom=11,
+            mapbox_style=carto-positron,
+            animation_frame=Minute,
+            color_continuous_scale=Jet,
+            range_color=[zmin, 5zmax]
+        )
+        fig2.update_layout(title='Predicted Power Consumption')
+
+        return fig, fig2
+        
+    #Plots the 3D heat maps
+    elif mode == '3D Mode'
+        frames_3d = []
+        #Builds and stores the plot of every 15 minutes of the data in the frames array
+        for minute in df['Minute'].unique()
+            filtered_df = df[df['Minute'] == minute].dropna(subset=['X Coordinate', 'Y Coordinate'])
+
+            if filtered_df.empty
+                continue
+
+            x = np.linspace(filtered_df['X Coordinate'].min(), filtered_df['X Coordinate'].max(), 50)
+            y = np.linspace(filtered_df['Y Coordinate'].min(), filtered_df['Y Coordinate'].max(), 50)
+            x, y = np.meshgrid(x, y)
+            z = griddata((filtered_df['X Coordinate'], filtered_df['Y Coordinate']),
+                         filtered_df[powertrain], (x, y), method='linear', fill_value=0)
+
+            frame = go.Frame(
+                data=[go.Surface(
+                    x=x, y=y, z=z,
+                    colorscale='Jet',
+                    cmin=global_min,
+                    cmax=global_max,
+                    colorbar=dict(title=titler(powertrain))
+                )],
+                name=str(minute)
+            )
+            frames_3d.append(frame)
+
+        #Sets up the intitial frame which will appear when GUI is loaded
+        initial_df = df[df['Minute'] == 15].dropna(subset=['X Coordinate', 'Y Coordinate'])
+
+        if not initial_df.empty
+            x = np.linspace(initial_df['X Coordinate'].min(), initial_df['X Coordinate'].max(), 50)
+            y = np.linspace(initial_df['Y Coordinate'].min(), initial_df['Y Coordinate'].max(), 50)
+            x, y = np.meshgrid(x, y)
+            z = griddata((initial_df['X Coordinate'], initial_df['Y Coordinate']),
+                         initial_df[powertrain], (x, y), method='linear', fill_value=0)
+        else
+            x, y, z = [], [], []
+
+        fig1 = go.Figure(data=[
+            go.Surface(
+                x=x, y=y, z=z,
+                colorscale='Jet',
+                cmin=global_min,
+                cmax=global_max,
+                colorbar=dict(title=titler(powertrain))
+            ),
+            go.Scatter3d(
+                x=initial_df['X Coordinate'], y=initial_df['Y Coordinate'], z=[global_min]  len(initial_df),
+                mode='markers',
+                marker=dict(size=4, color='black')
+            )
+        ], frames=frames_3d)
+
+        #Sets up the layout of the plots, including map styling, setting titles, building the timeline, etc.
+        fig1.update_layout(
+            scene=dict(
+                xaxis_title='X Coordinate',
+                yaxis_title='Y Coordinate',
+                zaxis_title=powertrain,
+                zaxis=dict(range=[global_min, global_max])
+            ),
+            title='Actual Power Consumption',
+            sliders=[{
+                steps [{
+                    args [
+                        [frame.name],
+                        {frame {duration 1000, redraw True},
+                         mode immediate,
+                         transition {duration 1000}}
+                    ],
+                    label frame.name,
+                    method animate
+                } for frame in frames_3d],
+                transition {duration 1000},
+                x 0,
+                y 0,
+                currentvalue {font {size 20}, prefix Minute, visible True, xanchor center},
+                len 1.0
+            }],
+            updatemenus=[{
+                buttons [
+                    {
+                        args [None, {frame {duration 1250, redraw True},
+                                        fromcurrent True, transition {duration 1000}}],
+                        label Play,
+                        method animate
+                    },
+                    {
+                        args [[None], {frame {duration 0, redraw True},
+                                          mode immediate, transition {duration 0}}],
+                        label Pause,
+                        method animate
+                    }
+                ],
+                direction left,
+                pad {r 10, t 50},
+                showactive False,
+                type buttons,
+                x 0.1,
+                xanchor right,
+                y -0.15,
+                yanchor top
+            }]
+        )
+
+        #Does the same thing as above just for predicted power consumption (Predicted power consumption data not implemented yet)
+        fig2 = go.Figure(data=[
+            go.Surface(
+                x=x, y=y, z=z,
+                colorscale='Jet',
+                cmin=global_min,
+                cmax=global_max,
+                colorbar=dict(title=titler(powertrain))
+            ),
+            go.Scatter3d(
+                x=initial_df['X Coordinate'], y=initial_df['Y Coordinate'], z=[global_min]  len(initial_df),
+                mode='markers',
+                marker=dict(size=4, color='black')
+            )
+        ], frames=frames_3d)
+
+        fig2.update_layout(
+            scene=dict(
+                xaxis_title='X Coordinate',
+                yaxis_title='Y Coordinate',
+                zaxis_title=powertrain,
+                zaxis=dict(range=[global_min, global_max])
+            ),
+            title='Predicted Power Consumption',
+            sliders=[{
+                steps [{
+                    args [
+                        [frame.name],
+                        {frame {duration 1500, redraw True},
+                         mode immediate,
+                         transition {duration 1000}}
+                    ],
+                    label frame.name,
+                    method animate
+                } for frame in frames_3d],
+                transition {duration 1000},
+                x 0,
+                y 0,
+                currentvalue {font {size 20}, prefix Minute, visible True, xanchor center},
+                len 1.0
+            }],
+            updatemenus=[{
+                buttons [
+                    {
+                        args [None, {frame {duration 1250, redraw True},
+                                        fromcurrent True, transition {duration 1000}}],
+                        label Play,
+                        method animate
+                    },
+                    {
+                        args [[None], {frame {duration 0, redraw True},
+                                          mode immediate, transition {duration 0}}],
+                        label Pause,
+                        method animate
+                    }
+                ],
+                direction left,
+                pad {r 10, t 50},
+                showactive False,
+                type buttons,
+                x 0.1,
+                xanchor right,
+                y -0.15,
+                yanchor top
+            }]
+        )
+
+        return fig1, fig2
+
+def refresh_dataframe(interval=30)
+    global df
+    while True
+        try
+            subprocess.run([
+                jupyter, nbconvert,
+                --to, notebook,
+                --execute,
+                --inplace,
+                DataFrame.ipynb
+            ])
+            new_df = pd.read_csv(csv_path)
+            with df_lock
+                df = new_df
+            print(f[{time.ctime()}] DataFrame reloaded)
+        except Exception as e
+            print(fError reading CSV {e})
+        time.sleep(interval)
+
+refresh_thread = threading.Thread(target=refresh_dataframe, daemon=True)
+refresh_thread.start()
+
+app.run(debug=True, port=8052)
